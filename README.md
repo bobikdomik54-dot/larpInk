@@ -1,4 +1,4 @@
-# larpInk — Single-GPU H100 & A100 SFT Engine for Looped 48-Layer MoE
+# larpInk is SFT Engine for Inkling Mini 2
 
 > **Backstory:** Built purely out of boredom together with **Antigravity (Gemini Neon 4)** — an experiment to see how fast we could push real SFT on a single **NVIDIA H100 80GB HBM3** (and **A100 80GB**) for the 48-layer looped MoE model [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) using custom CUDA/CUTLASS (`sm_90a`) and Triton kernels without degrading `EvalLoss`.
 >
