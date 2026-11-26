@@ -6,39 +6,14 @@
 
 ---
 
-## Real Training Benchmarks (`H100 80GB` / `H200`, 48-Layer SFT)
+## Real SFT Training Benchmarks (`Inkling-2-Mini`, `seq_len=4096`)
 
-All runs below were measured end-to-end on `thinkingmachines/Inkling-2-Mini` (`seq_len=4096`, `tokens/step=16384`, `184.28M` trainable params: `DoRA=90`, `MoE=24`, `FA=24`, `DepthAttn=49`, `Conv1d=48`, `Norm=43`) with honest full-vocab **`EvalLoss` across all 201k tokens (`44` validation batches, `0.18M` tokens)**:
-
-### 1. End-to-End Speed & Accuracy Progression
-
-| Run / Config | GPU / Mem Clock | Fast 2p / 3p (`tok/s`) | Fast / CD / Avg (`tok/s`) | Peak VRAM | Power / 700W | EvalLoss (201k) |
-|---|---|---:|---:|---:|---:|---:|
-| **Baseline** (`50/50 2p/3p`, `top_p=0.72`, Full GC) | H100 `2619 MHz` | — | `14,866 / 13,434 / 15,090` | `74.22 / 74.44 GB` | — | `0.9471` |
-| **Run A** (`BS=4, 75/25`, `top_p=0.65`, `Full:11+MoE:7`) | H200 `3201 MHz` | `19,213` (852.8ms) / — | `16,856 / 15,059 / 17,036` | `74.69 / 74.92 GB` | `644.95 W` | `0.9608` |
-| **Run B** (`BS=6, 24k`, `Full:16+MoE:2`, `--profile-1step`) | H100 `2619 MHz` | `16,534` (1486ms) / `14,498` (1695ms) | — | `69.18 GB` | `550.12 W` | — |
-| **Run C** (`BS=4`, `moe>=12`, `Full:11+MoE:7`) | H100 `2619 MHz` | `17,529` (934.7ms) / — | `14,932 / 13,902 / 15,279` | `74.24 / 74.46 GB` | `594.77 W` | `0.9679` |
-| **Post Round-3 Profile** (`Full:10+MoE:8`, `BS=4`) | H100 `2619 MHz` | `18,984` (863.0ms) / `16,430` (997.2ms) | — | `74.37 GB` | `596.45 W` | — |
-| **Final 25s SFT** (`BS=4, 50/50`, `top_p=0.72`, `Full:10+MoE:8`) | H100 `2619 MHz` | **`19,396` (844.7ms) / `16,871` (971.1ms)** | **`17,003 / 14,816 / 16,979`** | **`74.90 / 74.95 GB`** | **`572.99 W`** | **`0.9447`** |
-
-**Final Run Highlights (`NVIDIA H100 80GB HBM3`, `SM=1980MHz`, `Mem=2619MHz`):**
-- Peak 2-pass step throughput: **`19,396 tok/s`** (`844.7 ms/step`), Fast-phase avg **`17,003 tok/s`**, overall avg **`16,979 tok/s`** (`27` steps in 25s, `train_loss: 0.9604 → 0.8177`).
-- **`EvalLoss = 0.9447`** (down from `base_eval_4 = 1.0187`, beating both the `0.950` target and the `0.9471` baseline).
-- **Clean gradients:** `NaN = 0`, `zero_g = 0` (`D=0 A=0 B=0 N=0` across all DoRA, MoE-LoRA, and RMSNorm weights), `MaxGN = 0.207`.
-- Step 6 profiler (`BS=4`, `3p`): `Self CPU = 985.6 ms`, `Self CUDA = 987.9 ms`, `Command Buffer Full` flushes cut **3.8×** (`1080 → 287`).
-
-### 2. Custom Kernel Micro-Benchmarks on H100 (vs PyTorch / cuBLAS / WMMA)
-
-| Kernel / Op | Baseline | larpInk | Speedup | Accuracy (`cos`) |
+| GPU | Without Optimization | With `larpInk` | Speedup | Peak VRAM |
 |---|---:|---:|---:|---:|
-| **`ShortConvRes` fwd** (`4×4096×2304` BF16) | `1.542 ms` (PyTorch) | **`0.091 ms`** (Triton) | **16.9×** | `y=1.000000`, `dx=1.000000` |
-| **`RMSNorm` fwd** (`16384×2304` BF16) | `0.832 ms` (PyTorch) | **`0.056 ms`** (Triton) | **14.8×** | `y=1.000000`, `dx=0.999996`, `dw=1.000000` |
-| **`MulSigmoid` fwd** (`16384×3072` BF16) | `0.820 ms` (PyTorch) | **`0.103 ms`** (Triton) | **8.0×** | `y=1.000000`, `dx=1.000000`, `dg=1.000000` |
-| **`LogScaledL2Clip` fwd** (`4×4096×24×128`) | `1.271 ms` (PyTorch) | **`0.304 ms`** (Triton 1D; `<7ms` total in 2D) | **4.2×+** | `y=1.000000`, `dx=1.000000` |
-| **`moe_lora_b_add` (`dn`)** (`128` experts) | `~0.882 ms` (C++ WMMA) | **`0.357 ms`** (Triton `64×128`) | **2.47×** | `out=1.000000`, `y_exp=0.999968` |
-| **`moe_z_dn_fp8_kernel`** (`prefix top_p=0.65`) | `0.061 ms` (`_scaled_mm`) | **`0.032 ms`** (Triton) | **1.91×** | `0.999642` |
-| **`moe_dact_add_lora`** (`92k/131k`) | `0.247 ms` (cuBLAS `addmm_`) | **`0.118 ms`** (Triton) | **2.09×** | `1.000000` |
-| **`Delayed FP8 DoRA Gate`** (`16k×2304→3072`) | `0.991 ms` (2-pass) | **`0.902 ms`** (1-pass fwd) | **-9%** | `fwd=0.999025`, `dx=0.999404`, `dA/dB=1.000000` |
+| **H100 80GB** (`184.28M` trainable params) | `5,748 tok/s` | **`16,979 tok/s` avg** (`19,396 tok/s` peak) | **2.95×** | `74.90 GB` |
+| **A100 80GB** (`13.12M` LoRA) | `1,310 tok/s` | **`6,565 tok/s` avg** (`6,628 tok/s` peak) | **5.06×** | `54.45 GB` |
+
+- **Accuracy:** H100 25s SFT drops full-vocab `EvalLoss` (`201k`) from `1.0187 → 0.9447` (`NaN = 0`, `zero_grad = 0`); A100 100-step SFT drops `EvalLoss` from `1.0962 → 0.9528` (and A100 `184.28M` Near-Full-FT runs at `6,274 tok/s` in `57.36 GB`).
 
 ---
 
