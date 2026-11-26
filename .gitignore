@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.o
+*.a
+build/
+dist/
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+*.pt
+*.safetensors
