@@ -1,44 +1,41 @@
-# Подробный туториал: H100 (`sm_90a`) сборка, запуск и интеграция ядер в своё обучение
+# H100 Tutorial (`sm_90a`): Build, Run & Kernel Integration Guide
 
-Этот гайд объясняет, как за 5 минут завести `h100/train_inkling_h100.py` на Modal или локальной H100 80GB, а также как без проблем вытащить и подключить кастомные C++/CUDA и Triton-ядра в свой собственный PyTorch-пайплайн.
-
----
-
-## 1. Требования к окружению
-
-- **GPU:** `NVIDIA H100 80GB HBM3` (`sm_90a`, compute capability `9.0`). На A100/RTX4090 код `fa_inkling.cu` (использует Hopper WGMMA) не скомпилируется — для A100 используйте ветку [`../a100/`](../a100/).
-- **CUDA Toolkit:** `12.6+` (для `torch._scaled_grouped_mm` и Hopper FP8/`wgmma`).
-- **PyTorch:** `2.7.0+cu126` (или новее с поддержкой `torch._scaled_mm`, `torch._scaled_grouped_mm` и `torch.float8_e4m3fn`).
-- **Библиотеки:** `triton>=3.0`, `transformers>=4.45.0`, `datasets`, `accelerate`, `huggingface_hub`, `peft`.
-- **Для сборки C++ модулей локально:** `ninja`, `g++`, CUDA `nvcc` 12.6+, **CUTLASS v3.6.0**.
+This guide covers setting up `h100/train_inkling_h100.py` on Modal or a local H100 80GB machine, plus a practical checklist for integrating the custom CUDA/C++ and Triton kernels into your own PyTorch/HuggingFace training loop cleanly.
 
 ---
 
-## 2. Сборка нативного модуля `inkling_h100_ops.so`
+## 1. Environment Requirements
 
-### Вариант А — Через Modal (проще всего, сборка на CPU почти бесплатно)
+- **GPU:** `NVIDIA H100 80GB HBM3` (`sm_90a`, compute capability `9.0`). `fa_inkling.cu` relies on Hopper WGMMA instructions and will not compile on A100/Ada — use [`../a100/`](../a100/) for A100.
+- **CUDA Toolkit:** `12.6+` (`torch._scaled_grouped_mm`, FP8 E4M3, Hopper WGMMA).
+- **PyTorch:** `2.7.0+cu126` (or newer with `_scaled_mm` / `_scaled_grouped_mm`).
+- **Python packages:** `triton>=3.0`, `transformers>=4.45.0`, `datasets`, `accelerate`, `huggingface_hub`, `peft`.
+- **Local C++ build tools (if not using Modal):** `ninja`, `g++`, `nvcc` 12.6+, **CUTLASS v3.6.0**.
+
+---
+
+## 2. Building `inkling_h100_ops.so`
+
+### Option A — Modal CPU Builder (Easiest, zero GPU spend)
 
 ```bash
 cd larpInk
 modal run h100/kernels/build_and_bench.py --build-only
 ```
-Скрипт:
-1. Поднимет CPU-контейнер с `CUDA 12.6`, `ninja-build`, `ccache` и CUTLASS `v3.6.0`.
-2. Проверит SHA-256 всех `*.cu` и `*.cpp` в `h100/kernels/`.
-3. Скомпилирует `fa_inkling.cu`, `moe_cutlass.cu`, `dora_cublaslt.cu` и `bindings.cpp` с `-gencode arch=compute_90a,code=sm_90a` и положит готовый `inkling_h100_ops.so` в Modal Volume `h100-cpp-build-cache` (`/build_cache/inkling_h100_ops.so`).
+This spins up a CPU container (`CUDA 12.6`, `ninja-build`, `ccache`, CUTLASS `v3.6.0`), hashes `*.cu`/`*.cpp` in `h100/kernels/`, compiles with `-gencode arch=compute_90a,code=sm_90a`, and saves `/build_cache/inkling_h100_ops.so` in the Modal Volume `h100-cpp-build-cache`.
 
-Проверить сами ядра отдельно (микробенч на H100):
+Run standalone C++ kernel micro-benchmarks on H100:
 ```bash
 modal run h100/kernels/build_and_bench.py --skip-build --target full
 ```
 
-### Вариант Б — Локальная сборка на Linux H100 (без Modal)
+### Option B — Local Linux H100 Build (Without Modal)
 
-1. Склонируйте CUTLASS `v3.6.0`:
+1. Clone CUTLASS `v3.6.0`:
    ```bash
    git clone --depth 1 --branch v3.6.0 https://github.com/NVIDIA/cutlass.git /opt/cutlass
    ```
-2. Соберите `inkling_h100_ops.so` командой из `build_and_bench.py`:
+2. Compile `inkling_h100_ops.so` (exact flags from `build_and_bench.py`):
    ```bash
    python3 - <<'EOF'
    import os, sysconfig, torch
@@ -73,21 +70,21 @@ modal run h100/kernels/build_and_bench.py --skip-build --target full
    print("Built inkling_h100_ops.so OK")
    EOF
    ```
-3. В скрипте укажите путь `so_path = "./inkling_h100_ops.so"` (или скопируйте `.so` в `/build_cache/inkling_h100_ops.so`).
+3. Point `so_path` in `train_inkling_h100.py` to `./inkling_h100_ops.so` (or copy it to `/build_cache/inkling_h100_ops.so`).
 
 ---
 
-## 3. Подготовка датасета и запуск обучения
+## 3. Dataset Format & Running SFT
 
-Скрипт `h100/train_inkling_h100.py` на лету пакует датасет в последовательности фиксированной длины `4096` с корректной картой документов `doc_id` (чтобы внимание не протекало между разными примерами) и маской промпта `-100`.
+`h100/train_inkling_h100.py` packs samples on the fly to `seq_len=4096` with `doc_id` boundaries (preventing cross-sample attention) and `-100` prompt masking.
 
-Поддерживаются оба популярных формата `.jsonl` (и HuggingFace Datasets):
-- **Alpaca-формат:** `{"instruction": "...", "input": "...", "output": "..."}`
-- **ChatML / ShareGPT-формат:** `{"messages": [{"role": "system"|"user"|"assistant", "content": "..."}]}`
+Supported `.jsonl` / HuggingFace dataset schemas:
+- **Alpaca format:** `{"instruction": "...", "input": "...", "output": "..."}`
+- **ChatML / ShareGPT format:** `{"messages": [{"role": "system"|"user"|"assistant", "content": "..."}]}`
 
-### Рекомендуемые команды запуска (Modal)
+### Recommended Commands
 
-1. **Профилирование и проверка скорости/VRAM за ~50–65 секунд (`--profile-1step`):**
+1. **6-step speed & profiler sanity check (`--profile-1step`):**
    ```bash
    modal run h100/train_inkling_h100.py \
      --tokens-per-step 16384 \
@@ -96,7 +93,7 @@ modal run h100/kernels/build_and_bench.py --skip-build --target full
      --moe-gc-layers 8 \
      --profile-1step
    ```
-2. **Контрольный SFT-прогон на 25с + замер честного `EvalLoss` на 201k-словаре:**
+2. **25s control SFT + full 201k-vocab `EvalLoss`:**
    ```bash
    modal run h100/train_inkling_h100.py \
      --tokens-per-step 16384 \
@@ -109,10 +106,10 @@ modal run h100/kernels/build_and_bench.py --skip-build --target full
      --no-run-merge-check \
      --run-final-eval
    ```
-3. **Полноценный SFT с финальным merge-тестом в BF16 (укажите свой `--time-limit-s`, например `600` сек, и `--cooldown-start-s 520`):**
+3. **Longer SFT run + real BF16 merge verification:**
    ```bash
    modal run h100/train_inkling_h100.py \
-     --dataset yahma/alpaca-cleaned \
+     --dataset my_data.jsonl \
      --tokens-per-step 16384 \
      --time-limit-s 600 \
      --cooldown-start-s 520 \
@@ -122,7 +119,7 @@ modal run h100/kernels/build_and_bench.py --skip-build --target full
      --run-merge-check
    ```
 
-> **Важно про сохранение весов на H100:** `train_inkling_h100.py` изначально написан как высокоскоростной stress/eval-раннер и проверяет мердж в памяти (`m_merged`), не записывая `.safetensors` на диск. Для сохранения итоговой модели добавьте после строки `eval_after = eval_full_vocab_loss_all(m_merged, ...)` в конце функции `train_h100`:
+> **Note on saving checkpoints:** `train_inkling_h100.py` was built as a speed/eval stress runner — it merges and verifies `m_merged` in VRAM without writing `.safetensors` to disk. To persist the merged HF checkpoint, add after `eval_after = eval_full_vocab_loss_all(m_merged, ...)` inside `train_h100`:
 > ```python
 > save_dir = "/cache_vol/merged_h100_model"
 > m_merged.save_pretrained(save_dir)
@@ -132,14 +129,11 @@ modal run h100/kernels/build_and_bench.py --skip-build --target full
 
 ---
 
-## 4. Как встроить эти ядра в свой собственный PyTorch / HuggingFace код
+## 4. How to Plug These Kernels Into Your Own PyTorch Code
 
-Весь стек модульный — вам не обязательно использовать наш цикл целиком. Ниже точный чеклист, что и в каком порядке подключать, чтобы **всё пошло с первого раза без падений и расхождений градиентов**.
+Follow this exact order so everything works smoothly without shape bugs or Dynamo errors:
 
-### Правило №1: Строгий порядок патчинга модели
-Сначала патчите классы, **потом** загружайте или сразу после загрузки заменяйте слои, и только в самом конце настраивайте Gradient Checkpointing и Optimizer!
-
-1. **Загрузка `.so`:**
+1. **Load the compiled extension:**
    ```python
    import importlib.util
    spec = importlib.util.spec_from_file_location("inkling_h100_ops", "/path/to/inkling_h100_ops.so")
@@ -147,45 +141,35 @@ modal run h100/kernels/build_and_bench.py --skip-build --target full
    spec.loader.exec_module(ops)
    ```
 
-2. **Подключение `FastFP8DoRALinear` к любым `nn.Linear` (работает для любой LLM, не только Inkling!):**
-   - Скопируйте из `train_inkling_h100.py` ядра `fp8_amax_part_kernel`, `fp8_quant_from_part_kernel`, `dora_1x_lora_scale_inplace_kernel`, `dora_1x_bwd_scale_dm_kernel`, `fp8_quant_from_dynmax_kernel`, `fp8_quant_delayed_and_amax_kernel`, класс `_Fused1xFP8DoRAFn` и класс `FastFP8DoRALinear`.
-   - **Обязательно** после каждого `optimizer.step()` вызывайте:
-     - `roll_dora_fp8_scales()` — сдвигает историю `amax` для следующего шага.
-     - `refresh_all_dora_norms()` (раз в 4 шага и перед любым `eval()`/мерджем) — обновляет `cached_inv_norm` без хранения `w0_bf16` в VRAM.
-   - **Требования к тензорам:** `in_features`, `out_features` желательно кратны `16` (для некратного числа токенов `M_d & 15 != 0` встроен безопасный GPU-паддинг).
-   - **Не ставьте `torch.compile` поверх `FastFP8DoRALinear`!** На классе уже стоит `@torch.compiler.disable`, чтобы Dynamo не плодил граф-брейки.
+2. **Drop in `FastFP8DoRALinear` (works on any LLM `nn.Linear`):**
+   - Copy `fp8_amax_part_kernel`, `fp8_quant_from_part_kernel`, `dora_1x_lora_scale_inplace_kernel`, `dora_1x_bwd_scale_dm_kernel`, `fp8_quant_from_dynmax_kernel`, `fp8_quant_delayed_and_amax_kernel`, `_Fused1xFP8DoRAFn`, and `FastFP8DoRALinear`.
+   - Call `roll_dora_fp8_scales()` after every `optimizer.step()`, and call `refresh_all_dora_norms()` every ~4 steps and before `eval()` / merging.
+   - Keep `@torch.compiler.disable` on `FastFP8DoRALinear.forward` so Dynamo does not trace around custom FP8 ops.
 
-3. **Подключение `PatchedFP8Experts` (для MoE-слоёв с GeGLU/SwiGLU):**
-   - Скопируйте `moe_z_dn_fp8_kernel`, `moe_dact_add_lora_kernel`, `moe_lora_dB_fp8_v2_kernel`, `moe_lora_dA_dn_fp8_kernel`, `moe_lora_b_add_triton_kernel` и класс `PatchedFP8Experts`.
-   - **Ограничения C++ ядра `moe_cutlass.cu`:** размеры скрытого слоя в `moe_cutlass.cu` захардкожены константами `MOE_H = 2304`, `MOE_I = 1152`, `MOE_R = 16`! Если переносите на другую модель (с другим `hidden_size` или `intermediate_size`), обновите `MOE_H` / `MOE_I` / `MOE_R` в верхней части `h100/kernels/moe_cutlass.cu` и пересоберите `.so`!
-   - **Раздельное отключение LoRA:** используйте `enable_lora=(idx >= moe_lora_start)` и `enable_grad=(idx >= freeze_until)` отдельно — иначе ранние слои с градиентами, но без MoE-LoRA потеряют транспонированные FP8 веса `w_dn_T_fp8_T`/`w_gu_T_fp8_T` для backward.
-   - **Роутер всегда `requires_grad=False`** (но градиент `d_w` течёт обратно к выходу роутера `top_k_weights`).
+3. **Drop in `PatchedFP8Experts` (FP8 MoE + LoRA):**
+   - Copy `moe_z_dn_fp8_kernel`, `moe_dact_add_lora_kernel`, `moe_lora_dB_fp8_v2_kernel`, `moe_lora_dA_dn_fp8_kernel`, `moe_lora_b_add_triton_kernel`, and `PatchedFP8Experts`.
+   - **Check hardcoded dimensions in `h100/kernels/moe_cutlass.cu`:** `MOE_H = 2304`, `MOE_I = 1152`, `MOE_R = 16`. If your target model has different dimensions, update those constants at the top of `moe_cutlass.cu` and rebuild `.so`.
+   - Separate `enable_lora=(idx >= moe_lora_start)` from `enable_grad=(idx >= freeze_until)` so layers that require `dx` still keep `w_dn_T_fp8_T`/`w_gu_T_fp8_T`.
 
-4. **Подключение C++ FlashAttention (`fa_inkling.cu`) + packed `doc_id`:**
-   - Потребуются буферы `doc_id` (`int16 [B, S]`) и предрасчитанные `q_n_start`, `k_m_start`, `k_m_end` (`int32 [B, S]`, см. `precompute_doc_bounds_cpu`).
-   - Входные `q, k, v` подаются через `_fast_t12_contiguous_4d` (коалесцированный Triton-транспоз `[B, S, H, D] ↔ [B, H, S, D]`), `head_dim = 128`, `sliding_win = 1024`. Если меняете `head_dim`, проверьте шаблонные параметры в `fa_inkling.cu`.
+4. **Drop in `fa_inkling.cu` (Hopper WGMMA Attention):**
+   - Pass precomputed `doc_id` (`int16 [B, S]`) and `q_n_start`, `k_m_start`, `k_m_end` (`int32 [B, S]`).
+   - Route `q, k, v` through `_fast_t12_contiguous_4d` (`[B, S, H, D] ↔ [B, H, S, D]`, `D=128`).
 
-5. **Подключение Triton Elementwise стека (`RMSNorm`, `ShortConvRes`, `Scaled/LogL2Clip`, `MulSigmoid`, `MessageGateMix`):**
-   - Все эти классы универсальны по `batch`/`seq_len` и могут использоваться отдельно:
-     - `TritonRMSNormFn`: работает для любого `N_dim <= 8192` в BF16/FP32.
-     - `TritonMulSigmoidFn`: `x * sigmoid(gate)` в BF16 без FP32-тензоров.
-     - `TritonShortConvResFn`: depthwise `conv1d(k=4, bias=None, weight frozen) + x * res_scale`.
-     - `TritonScaledL2ClipFn`: head-wise L2-clip с опциональным `scale` и `log_scale`.
-     - `TritonDepthAttnPairFn`: для `BlockAttentionResidual` (`K_prev <= 4`, `hdim <= 4096`) сразу возвращает **контигуальные** срезы `out_mn_first=True`, убирая сотни скрытых `aten::copy_`.
-   - **Важно:** если заменяете этими ядрами модули модели, **не** оборачивайте их в `torch.compile` — иначе Dynamo начнёт ловить несовпадения `grad_mode`/`dtype`/`requires_grad`. В `compile_targets` оставляйте только чистый `Inkling2LoopTopKRouter` с `.contiguous()`-входом.
+5. **Drop in the Triton Elementwise Stack (`RMSNorm`, `ShortConvRes`, `Scaled/LogL2Clip`, `MulSigmoid`, `MessageGateMix`):**
+   - Do **not** wrap modules patched with these Triton kernels in `torch.compile` — keep `torch.compile` strictly on pure PyTorch ops like `Inkling2LoopTopKRouter` (with `.contiguous()` inputs).
 
-6. **Hybrid Selective GC + CUDA Graph Prefix (`run_nograd_prefix`):**
-   - Для 80GB H100 при `BS=4, S=4096` оптимальный баланс: `--full-gc-layers 10 --moe-gc-layers 8` (`PeakVRAM ≈ 74.9 GB`).
-   - Если используете CUDA Graphs для `no_grad` префикса с двумя глубинами цикла (`2p` и `3p`), **обязательно** передавайте и один общий `pool`, и **один общий `stream`** (`cg_cfg.setdefault("stream", torch.cuda.Stream())`) + `torch.cuda.empty_cache()` перед захватом, иначе CachingAllocator выделит отдельный приватный пул под каждый стрим (+3–5 GB VRAM и OOM).
+6. **Hybrid Selective GC + CUDA Graph Prefix:**
+   - For `BS=4, S=4096` on 80GB H100, `--full-gc-layers 10 --moe-gc-layers 8` keeps `PeakVRAM` around `~74.9 GB`.
+   - When capturing multiple CUDA Graphs (e.g. `2p` and `3p` prefixes), **reuse both one shared `pool` and one shared `stream`** (`cg_cfg.setdefault("stream", torch.cuda.Stream())`) + `torch.cuda.empty_cache()` before capture — otherwise PyTorch allocates separate private pools per stream (+3–5 GB VRAM).
 
 ---
 
-## 5. Частые проблемы и решения (Troubleshooting)
+## 5. Troubleshooting
 
-| Симптом | Причина | Решение |
+| Issue | Cause | Fix |
 |---|---|---|
-| `Missing prebuilt C++ extension /build_cache/inkling_h100_ops.so` | `.so` ещё не скомпилирован | Запустите `modal run h100/kernels/build_and_bench.py --build-only` |
-| `CUDA out of memory` при уменьшении `--full-gc-layers` | Не-checkpointed слои внимания + DoRA держат ~2.5–2.9 GB/слой | Увеличьте `--full-gc-layers 10` (или `11`) и уменьшите `--moe-gc-layers 8` (или `7`), сумма = `18` |
-| `EvalLoss` вырос (напр. `0.96+` вместо `<= 0.950`) | Слишком редкие 3-витковые проходы (`75/25`) или слишком низкий `prefix_top_p` | Держите в Fast-фазе `50/50 2p/3p` (`opt_step % 2 == 0`), `prefix_top_p >= 0.70–0.72` и Cooldown (`top_p=1.0`, `3p`) |
-| `nvcc fatal : Unsupported gpu architecture 'compute_90a'` | Локальная CUDA < 12.0 или не H100 | Обновите CUDA Toolkit до `12.6+` (для A100 берите `../a100/`) |
-| Медленный 1-й шаг (~20–35с) | Разовая JIT-компиляция Triton и `torch.compile` на `TopKRouter` + захват 2 CUDA-графов | Это одноразовый warmup перед стартом таймера `t_train_start`, со 2–3 шага выходит на полную скорость |
+| `Missing prebuilt C++ extension /build_cache/inkling_h100_ops.so` | `.so` hasn't been built yet | Run `modal run h100/kernels/build_and_bench.py --build-only` |
+| `CUDA out of memory` when lowering `--full-gc-layers` | Non-GC attention + DoRA activations take ~2.5–2.9 GB/layer | Increase `--full-gc-layers 10` (or `11`) and decrease `--moe-gc-layers 8` (or `7`), sum = `18` |
+| `EvalLoss` regresses (`0.96+` vs `<= 0.950`) | Too few 3-pass steps (`75/25`) or `prefix_top_p` too low | Use `50/50 2p/3p` (`opt_step % 2 == 0`), `prefix_top_p >= 0.72`, and a `top_p=1.0` Cooldown |
+| `nvcc fatal: Unsupported gpu architecture 'compute_90a'` | CUDA `< 12.0` or non-Hopper GPU | Upgrade CUDA to `12.6+` (or use `../a100/` on Ampere) |
+| Slow step 1 (~20–35s) | One-time Triton JIT + `TopKRouter` compile + CUDA Graph capture | Warmup runs before `t_train_start`; steady-state starts on step 2–3 |

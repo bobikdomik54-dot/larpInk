@@ -1,27 +1,26 @@
-# Туториал: A100-80GB версия (`train_inkling_a100.py`)
+# A100-80GB Tutorial (`train_inkling_a100.py`)
 
-Эта ветка — автономное production-ready решение для **NVIDIA A100 80GB (`sm_80`)**, полностью написанное на **Triton + PyTorch** без необходимости компилировать внешние C++/CUDA `.cu` файлы.
-
----
-
-## 1. Ключевые особенности A100-стека
-
-- **Окружение:** `pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel`, `triton>=3.0.0`, `transformers>=4.45.0`, `flash-linear-attention`.
-- **Attention:** кастомный Triton `InklingFlashAttnLRVarlenFn` — блочный FlashAttention с per-head linear relative position bias, attention sinks, скользящим окном (`sliding_window`) и packed-баундари `doc_id` без cross-document утечек.
-- **MoE:** `PatchedINT8Experts` — INT8 Weight-Only Grouped GEMM с блочным квантованием, counting-sort `top_p`-роутингом и fused INT8 MoE-LoRA `A`/`B` (`GATE 1A` проверяет точность `cos >= 0.999` на каждом запуске).
-- **DoRA + CausalConv1d:** быстрые Triton-ядра для `causal_conv1d` и DoRA с пересчётом норм `refresh_all_dora_norms()` раз в шаг оптимизатора.
-- **Оптимизатор и память:** Batched Cautious Muon + AdamW, T-BPTT (`grad_passes=1` в Fast-фазе → `2` в Cooldown), CUDA Graph для префикса и Selective GC в Cooldown.
-- **Полный жизненный цикл обучения из коробки:**
-  - Автосохранение чекпоинтов адаптера (`best_lora.pt`, `latest_lora.pt`, включает веса DoRA, MoE-LoRA, RMSNorm и состояние Muon).
-  - Продолжение обучения с чекпоинта (`--resume`).
-  - Отдельная функция `merge_lora()` для слияния Dense LoRA-весов (`nn.Linear`) с проверкой косинусного сходства логитов (`logits_cos >= 0.999`) и сохранением BF16 HuggingFace-весов (`save_pretrained`). *(Примечание: `best_lora.pt` сохраняет все обучаемые параметры, включая MoE-LoRA и RMSNorm, а для полного мерджа ещё и MoE-экспертов + RMSNorm можно перенести блок `n_merged_moe` / `n_merged_norm` из [`../h100/train_inkling_h100.py`](../h100/train_inkling_h100.py).)*
+This branch targets **NVIDIA A100 80GB (`sm_80`)** using pure **Triton + PyTorch** — no external `.cu` compilation required.
 
 ---
 
-## 2. Быстрый запуск на Modal
+## 1. Stack Overview
 
-### Боевой SFT + автоматический Merge в чистый BF16
+- **Container / Environment:** `pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel`, `triton>=3.0.0`, `transformers>=4.45.0`, `flash-linear-attention`.
+- **Attention:** Custom Triton `InklingFlashAttnLRVarlenFn` — tiled FlashAttention with per-head linear relative position bias, attention sinks, sliding window (`sliding_window`), and packed `doc_id` boundaries.
+- **MoE:** `PatchedINT8Experts` — INT8 weight-only grouped GEMM with blockwise quantization, counting-sort `top_p` routing, and fused INT8 MoE-LoRA `A`/`B` (verified on startup via `GATE 1A`, `cos >= 0.999`).
+- **DoRA + CausalConv1d:** Triton `causal_conv1d` kernels and DoRA with `refresh_all_dora_norms()` once per optimizer step.
+- **Optimizers & Memory:** Batched Cautious Muon + AdamW, T-BPTT (`grad_passes=1` Fast → `2` Cooldown), CUDA Graph prefix, and Selective GC during Cooldown.
+- **Full Training Lifecycle Included:**
+  - Automatic adapter checkpoints (`best_lora.pt`, `latest_lora.pt` containing DoRA, MoE-LoRA, RMSNorm weights, and Muon momentum buffers).
+  - Seamless checkpoint resume (`--resume`).
+  - Built-in `merge_lora()` for Dense `nn.Linear` LoRA adapters with logits sanity verification (`logits_cos >= 0.999`) and pure BF16 HuggingFace `save_pretrained`. *(Note: `best_lora.pt` saves all trainable params including MoE-LoRA and RMSNorm; if you want `merge_lora()` to also fold MoE-LoRA and RMSNorm weights into the base checkpoint, copy the 6-line `n_merged_moe`/`n_merged_norm` block from [`../h100/train_inkling_h100.py`](../h100/train_inkling_h100.py).)*
 
+---
+
+## 2. Quickstart on Modal
+
+### Timed SFT + Auto-Merge to BF16
 ```bash
 cd larpInk
 modal run a100/train_inkling_a100.py \
@@ -32,8 +31,7 @@ modal run a100/train_inkling_a100.py \
   --merge-after
 ```
 
-### Обучение фиксированное число шагов (без лимита по времени)
-
+### Step-Based SFT (Custom `.jsonl` Dataset)
 ```bash
 modal run a100/train_inkling_a100.py \
   --dataset my_dataset.jsonl \
@@ -46,29 +44,28 @@ modal run a100/train_inkling_a100.py \
   --merge-after
 ```
 
-### Продолжение обучения (`--resume`) или только Merge (`--merge-only`)
-
+### Resume or Merge-Only
 ```bash
-# Дообучить с latest_lora.pt
+# Resume from latest_lora.pt
 modal run a100/train_inkling_a100.py --resume --output-dir /cache_vol/my_run --max-steps 300 --time-limit-s 0
 
-# Смерджить уже сохранённый best_lora.pt в HF BF16 модель и проверить генерацию
+# Merge existing best_lora.pt and run generation check
 modal run a100/train_inkling_a100.py --merge-only --output-dir /cache_vol/my_run --merged-dir /cache_vol/my_merged_model
 ```
 
 ---
 
-## 3. Основные CLI-флаги `a100/train_inkling_a100.py`
+## 3. CLI Flags (`a100/train_inkling_a100.py`)
 
-| Флаг | По умолчанию | Описание |
+| Flag | Default | Description |
 |---|---|---|
-| `--dataset` | `yahma/alpaca-cleaned` | HF-датасет или путь к локальному `.jsonl` (Alpaca или ChatML `messages`) |
-| `--grad-accum` | `4` | Число микро-батчей на 1 шаг оптимизатора |
-| `--max-steps` | `100` | Лимит шагов (при `--time-limit-s 0`) |
-| `--time-limit-s` | `120.0` | Тайм-лимит обучения в секундах (`0` = отключить таймер, идти по `max_steps`) |
-| `--cooldown-start-s` | `100.0` | Момент перехода в Cooldown (`CUDAGraph=OFF`, `T-BPTT 2/3`, `top_p=1.0`, `Selective(1/3)` GC) |
-| `--eval-every` | `50` | Частота полной оценки по 201k-словарю |
-| `--resume` | `False` | Загрузить `latest_lora.pt` и продолжить с прерванного шага |
-| `--merge-after` | `False` | После обучения запустить `merge_lora()` и сохранить чистый BF16-чекпоинт |
-| `--merge-only` | `False` | Только смерджить существующий `best_lora.pt` |
-| `--eval-prompts-after` | `True` | Прогнать генерацию 3 контрольных промптов после тренировки/мерджа |
+| `--dataset` | `yahma/alpaca-cleaned` | HF dataset name or local `.jsonl` path (Alpaca or `messages`) |
+| `--grad-accum` | `4` | Micro-batches per optimizer step |
+| `--max-steps` | `100` | Optimizer step limit (used when `--time-limit-s 0`) |
+| `--time-limit-s` | `120.0` | Wall-clock training budget in seconds (`0` disables timer) |
+| `--cooldown-start-s` | `100.0` | Switch point to Cooldown (`CUDAGraph=OFF`, `T-BPTT 2/3`, `top_p=1.0`, `Selective(1/3)` GC) |
+| `--eval-every` | `50` | Full 201k-vocab evaluation cadence (in optimizer steps) |
+| `--resume` | `False` | Resume from `latest_lora.pt` |
+| `--merge-after` | `False` | Run `merge_lora()` right after training finishes |
+| `--merge-only` | `False` | Skip training and merge `best_lora.pt` directly |
+| `--eval-prompts-after` | `True` | Generate 3 control prompt completions after training/merge |
